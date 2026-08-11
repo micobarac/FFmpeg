@@ -770,12 +770,17 @@ static int mediacodec_dec_get_video_codec(AVCodecContext *avctx, MediaCodecDecCo
         }
     }
 
-    profile = ff_AMediaCodecProfile_getProfileFromAVCodecContext(avctx);
-    if (profile < 0) {
-        av_log(avctx, AV_LOG_WARNING, "Unsupported or unknown profile\n");
-    }
+    /* The caller may have resolved the decoder already (the Dolby Vision
+     * path does, using the DV profile rather than the stream's). Only
+     * look one up when it hasn't. */
+    if (!s->codec_name) {
+        profile = ff_AMediaCodecProfile_getProfileFromAVCodecContext(avctx);
+        if (profile < 0) {
+            av_log(avctx, AV_LOG_WARNING, "Unsupported or unknown profile\n");
+        }
 
-    s->codec_name = ff_AMediaCodecList_getCodecNameByType(mime, profile, 0, avctx);
+        s->codec_name = ff_AMediaCodecList_getCodecNameByType(mime, profile, 0, avctx);
+    }
     if (!s->codec_name) {
         // getCodecNameByType() can fail due to missing JVM, while NDK
         // mediacodec can be used without JVM.
