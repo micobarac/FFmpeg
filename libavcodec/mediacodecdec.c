@@ -312,6 +312,10 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
     int sdk_int;
 
     const char *codec_mime = NULL;
+    /* Decoder resolved by the Dolby Vision path below, handed to
+     * ff_mediacodec_dec_init() so it doesn't re-resolve one using the
+     * HEVC profile of the stream. Ownership moves to s->ctx. */
+    char *dv_codec_name = NULL;
 
     FFAMediaFormat *format = NULL;
     MediaCodecH264DecContext *s = avctx->priv_data;
@@ -369,7 +373,7 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
 
                 /* CodecProfileLevel.DolbyVisionProfileDvheStn */
                 if (dovi->dv_profile == 5) {
-                    char *dv_name = ff_AMediaCodecList_getCodecNameByType(
+                    dv_codec_name = ff_AMediaCodecList_getCodecNameByType(
                         "video/dolby-vision", 0x20, 0, avctx);
 
                     /* Vendor gate. Kodi restricts its DV path to
@@ -378,24 +382,25 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
                      * stack and report "OMX.MS.". Both are accepted;
                      * everything else (Realtek "OMX.realtek.*", Amlogic,
                      * Qualcomm) stays on video/hevc and is unaffected. */
-                    if (dv_name && (!strncmp(dv_name, "OMX.MTK", 7) ||
-                                    !strncmp(dv_name, "OMX.MS.", 7))) {
+                    if (dv_codec_name &&
+                        (!strncmp(dv_codec_name, "OMX.MTK", 7) ||
+                         !strncmp(dv_codec_name, "OMX.MS.", 7))) {
                         codec_mime = "video/dolby-vision";
                         ff_AMediaFormat_setInt32(format, "profile", 0x20);
                         av_log(avctx, AV_LOG_INFO,
                                "Dolby Vision profile %d level %d: using %s "
                                "on %s\n",
                                dovi->dv_profile, dovi->dv_level, codec_mime,
-                               dv_name);
+                               dv_codec_name);
                     } else {
                         av_log(avctx, AV_LOG_INFO,
                                "Dolby Vision profile %d: no MTK/MStar DV "
                                "decoder (%s), staying on %s\n",
                                dovi->dv_profile,
-                               dv_name ? dv_name : "none", codec_mime);
+                               dv_codec_name ? dv_codec_name : "none",
+                               codec_mime);
+                        av_freep(&dv_codec_name);
                     }
-
-                    av_free(dv_name);
                 }
             }
         }
@@ -502,6 +507,11 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
 
     s->ctx->delay_flush = s->delay_flush;
     s->ctx->use_ndk_codec = s->use_ndk_codec;
+    /* Already resolved against the Dolby Vision profile; keeps
+     * mediacodec_dec_get_video_codec() from looking one up again with
+     * the stream's HEVC profile, which no DV decoder advertises. */
+    s->ctx->codec_name = dv_codec_name;
+    dv_codec_name = NULL;
 
     if ((ret = ff_mediacodec_dec_init(avctx, s->ctx, codec_mime, format)) < 0) {
         s->ctx = NULL;
@@ -527,6 +537,9 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
     }
 
 done:
+    /* Only still set if we bailed out before handing it to s->ctx. */
+    av_freep(&dv_codec_name);
+
     if (format) {
         ff_AMediaFormat_delete(format);
     }
