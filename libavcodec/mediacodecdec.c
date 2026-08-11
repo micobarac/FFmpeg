@@ -30,6 +30,7 @@
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/dovi_meta.h"
 #include "libavutil/pixfmt.h"
 #include "libavutil/internal.h"
 
@@ -347,6 +348,57 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
 #if CONFIG_HEVC_MEDIACODEC_DECODER
     case AV_CODEC_ID_HEVC:
         codec_mime = "video/hevc";
+
+        /* Dolby Vision: route to the display's DV decoder.
+         *
+         * Profile 5 carries no HDR10 base layer — its chroma is ICtCp.
+         * Decoded as plain HEVC it is read as YCbCr and the picture
+         * comes out tinted. Profiles 7/8 keep a usable base layer, so
+         * they are deliberately left on video/hevc: 7 is rarely
+         * supported by DV decoders, and 8 already looks correct.
+         *
+         * Mirrors Kodi (xbmc PR #22410, merged in Kodi 20). */
+        {
+            const AVPacketSideData *sd = av_packet_side_data_get(
+                avctx->coded_side_data, avctx->nb_coded_side_data,
+                AV_PKT_DATA_DOVI_CONF);
+
+            if (sd && sd->size >= sizeof(AVDOVIDecoderConfigurationRecord)) {
+                const AVDOVIDecoderConfigurationRecord *dovi =
+                    (const AVDOVIDecoderConfigurationRecord *)sd->data;
+
+                /* CodecProfileLevel.DolbyVisionProfileDvheStn */
+                if (dovi->dv_profile == 5) {
+                    char *dv_name = ff_AMediaCodecList_getCodecNameByType(
+                        "video/dolby-vision", 0x20, 0, avctx);
+
+                    /* Vendor gate. Kodi restricts its DV path to
+                     * "OMX.MTK"; MStar-lineage TV SoCs — MediaTek
+                     * absorbed MStar in 2019 — keep their own driver
+                     * stack and report "OMX.MS.". Both are accepted;
+                     * everything else (Realtek "OMX.realtek.*", Amlogic,
+                     * Qualcomm) stays on video/hevc and is unaffected. */
+                    if (dv_name && (!strncmp(dv_name, "OMX.MTK", 7) ||
+                                    !strncmp(dv_name, "OMX.MS.", 7))) {
+                        codec_mime = "video/dolby-vision";
+                        ff_AMediaFormat_setInt32(format, "profile", 0x20);
+                        av_log(avctx, AV_LOG_INFO,
+                               "Dolby Vision profile %d level %d: using %s "
+                               "on %s\n",
+                               dovi->dv_profile, dovi->dv_level, codec_mime,
+                               dv_name);
+                    } else {
+                        av_log(avctx, AV_LOG_INFO,
+                               "Dolby Vision profile %d: no MTK/MStar DV "
+                               "decoder (%s), staying on %s\n",
+                               dovi->dv_profile,
+                               dv_name ? dv_name : "none", codec_mime);
+                    }
+
+                    av_free(dv_name);
+                }
+            }
+        }
 
         ret = hevc_set_extradata(avctx, format);
         if (ret < 0)
