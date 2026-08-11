@@ -355,11 +355,16 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
 
         /* Dolby Vision: route to the display's DV decoder.
          *
-         * Profile 5 carries no HDR10 base layer — its chroma is ICtCp.
-         * Decoded as plain HEVC it is read as YCbCr and the picture
-         * comes out tinted. Profiles 7/8 keep a usable base layer, so
-         * they are deliberately left on video/hevc: 7 is rarely
-         * supported by DV decoders, and 8 already looks correct.
+         * Single-layer profiles only. 5 must be routed — it carries no
+         * HDR10 base layer, its chroma is ICtCp, and decoded as plain
+         * HEVC it is read as YCbCr and comes out tinted. 8 is routed so
+         * the panel performs real DV tone mapping instead of rendering
+         * the HDR10-compatible base layer.
+         *
+         * 7 stays on video/hevc: it is dual-layer (BL + EL + RPU) and
+         * Android DV components take single-layer input only, so playing
+         * its base layer as HDR10 is the correct fallback, not a
+         * shortcut. Converting it to 8.1 would mean rebuilding the RPU.
          *
          * Mirrors Kodi (xbmc PR #22410, merged in Kodi 20). */
         {
@@ -370,11 +375,14 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
             if (sd && sd->size >= sizeof(AVDOVIDecoderConfigurationRecord)) {
                 const AVDOVIDecoderConfigurationRecord *dovi =
                     (const AVDOVIDecoderConfigurationRecord *)sd->data;
+                /* CodecProfileLevel.DolbyVisionProfileDvheStn / DvheSt */
+                int dv_profile = dovi->dv_profile == 5   ? 0x20
+                                 : dovi->dv_profile == 8 ? 0x100
+                                                         : 0;
 
-                /* CodecProfileLevel.DolbyVisionProfileDvheStn */
-                if (dovi->dv_profile == 5) {
+                if (dv_profile) {
                     dv_codec_name = ff_AMediaCodecList_getCodecNameByType(
-                        "video/dolby-vision", 0x20, 0, avctx);
+                        "video/dolby-vision", dv_profile, 0, avctx);
 
                     /* Vendor gate. Kodi restricts its DV path to
                      * "OMX.MTK"; MStar-lineage TV SoCs — MediaTek
@@ -386,7 +394,7 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
                         (!strncmp(dv_codec_name, "OMX.MTK", 7) ||
                          !strncmp(dv_codec_name, "OMX.MS.", 7))) {
                         codec_mime = "video/dolby-vision";
-                        ff_AMediaFormat_setInt32(format, "profile", 0x20);
+                        ff_AMediaFormat_setInt32(format, "profile", dv_profile);
                         av_log(avctx, AV_LOG_INFO,
                                "Dolby Vision profile %d level %d: using %s "
                                "on %s\n",
