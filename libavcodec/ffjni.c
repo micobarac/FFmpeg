@@ -23,6 +23,7 @@
 #include <jni.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <sys/prctl.h>
 
 #include "libavutil/bprint.h"
 #include "libavutil/error.h"
@@ -73,14 +74,25 @@ JNIEnv *ff_jni_get_env(void *log_ctx)
 
     ret = (*java_vm)->GetEnv(java_vm, (void **)&env, JNI_VERSION_1_6);
     switch(ret) {
-    case JNI_EDETACHED:
-        if ((*java_vm)->AttachCurrentThread(java_vm, &env, NULL) != 0) {
+    case JNI_EDETACHED: {
+        // ART renames a thread that attaches without a name to
+        // "Thread-N", which erases the caller's thread name. Pass the
+        // current comm so the host can still find decoder threads by
+        // name after the attach.
+        char name[16] = {0};
+        JavaVMAttachArgs args = {
+            .version = JNI_VERSION_1_6,
+            .name = prctl(PR_GET_NAME, name, 0, 0, 0) == 0 ? name : NULL,
+            .group = NULL,
+        };
+        if ((*java_vm)->AttachCurrentThread(java_vm, &env, &args) != 0) {
             av_log(log_ctx, AV_LOG_ERROR, "Failed to attach the JNI environment to the current thread\n");
             env = NULL;
         } else {
             pthread_setspecific(current_env, env);
         }
         break;
+    }
     case JNI_OK:
         break;
     case JNI_EVERSION:
