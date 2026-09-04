@@ -384,15 +384,19 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
                     dv_codec_name = ff_AMediaCodecList_getCodecNameByType(
                         "video/dolby-vision", dv_profile, 0, avctx);
 
-                    /* Vendor gate. Kodi restricts its DV path to
-                     * "OMX.MTK"; MStar-lineage TV SoCs — MediaTek
-                     * absorbed MStar in 2019 — keep their own driver
-                     * stack and report "OMX.MS.". Both are accepted;
-                     * everything else (Realtek "OMX.realtek.*", Amlogic,
-                     * Qualcomm) stays on video/hevc and is unaffected. */
-                    if (dv_codec_name &&
-                        (!strncmp(dv_codec_name, "OMX.MTK", 7) ||
-                         !strncmp(dv_codec_name, "OMX.MS.", 7))) {
+                    /* Any vendor. Kodi's first DV patch (PR #19099, Kodi
+                     * 20) was MediaTek-only; its current code (PR #22950,
+                     * AndroidUtils::GetDolbyVisionCapabilities) takes any
+                     * decoder that advertises video/dolby-vision once the
+                     * display reports DV, with no name filtering. The
+                     * profile-qualified lookup above already guarantees a
+                     * decoder for this profile exists; on a TV the panel
+                     * is the display, so that is the whole check. Verified
+                     * MediaTek/MStar ("OMX.MTK", "OMX.MS.") 2026-08;
+                     * Realtek ("OMX.realtek.video.dvhe.st", TCL) added
+                     * 2026-09-04 after that TV showed the HDR10+ badge on
+                     * a DV file because this gate left it on video/hevc. */
+                    if (dv_codec_name) {
                         codec_mime = "video/dolby-vision";
                         ff_AMediaFormat_setInt32(format, "profile", dv_profile);
                         av_log(avctx, AV_LOG_INFO,
@@ -402,12 +406,9 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
                                dv_codec_name);
                     } else {
                         av_log(avctx, AV_LOG_INFO,
-                               "Dolby Vision profile %d: no MTK/MStar DV "
-                               "decoder (%s), staying on %s\n",
-                               dovi->dv_profile,
-                               dv_codec_name ? dv_codec_name : "none",
-                               codec_mime);
-                        av_freep(&dv_codec_name);
+                               "Dolby Vision profile %d: no DV decoder for "
+                               "this profile, staying on %s\n",
+                               dovi->dv_profile, codec_mime);
                     }
                 }
             }
