@@ -794,19 +794,41 @@ static int mediacodec_dec_get_video_codec(AVCodecContext *avctx, MediaCodecDecCo
         av_log(avctx, AV_LOG_DEBUG, "Found decoder %s\n", s->codec_name);
     }
 
-    if (s->codec_name)
-        s->codec = ff_AMediaCodec_createCodecByName(s->codec_name, s->use_ndk_codec);
-    else {
-        s->codec = ff_AMediaCodec_createDecoderByType(mime, s->use_ndk_codec);
-        if (s->codec) {
-            s->codec_name = ff_AMediaCodec_getName(s->codec);
-            if (!s->codec_name)
-                s->codec_name = av_strdup(mime);
+    /* TV SoCs with a single hardware HEVC instance (MStar/MediaTek:
+     * "open too many component failed ... current:1 max:1") release the
+     * previous instance asynchronously in the vendor codec service, so a
+     * creation issued a few hundred ms after the previous decoder was let
+     * go is refused with InsufficientResources. Measured 2026-09-06: a
+     * second request 150 ms after the first was refused and the player
+     * fell to software decoding. Back off and retry across the release
+     * window instead of failing on the first refusal. */
+    static const int retry_ms[] = { 50, 100, 200, 400 };
+    int attempt = 0, waited_ms = 0;
+    for (;;) {
+        if (s->codec_name)
+            s->codec = ff_AMediaCodec_createCodecByName(s->codec_name, s->use_ndk_codec);
+        else {
+            s->codec = ff_AMediaCodec_createDecoderByType(mime, s->use_ndk_codec);
+            if (s->codec) {
+                s->codec_name = ff_AMediaCodec_getName(s->codec);
+                if (!s->codec_name)
+                    s->codec_name = av_strdup(mime);
+            }
         }
+        if (s->codec || attempt >= FF_ARRAY_ELEMS(retry_ms))
+            break;
+        av_usleep(retry_ms[attempt] * 1000);
+        waited_ms += retry_ms[attempt];
+        attempt++;
     }
     if (!s->codec) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to create media decoder for type %s and name %s\n", mime, s->codec_name);
+        av_log(avctx, AV_LOG_ERROR, "Failed to create media decoder for type %s and name %s "
+               "(refused %d times over %d ms)\n", mime, s->codec_name, attempt + 1, waited_ms);
         return AVERROR_EXTERNAL;
+    }
+    if (attempt > 0) {
+        av_log(avctx, AV_LOG_WARNING, "MediaCodec %s creation refused %d time(s); "
+               "succeeded after %d ms\n", s->codec_name, attempt, waited_ms);
     }
 
     return 0;
