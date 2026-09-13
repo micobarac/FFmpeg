@@ -24,19 +24,8 @@
 #include "libavutil/common.h"
 #include "libavutil/parseutils.h"
 #include "htmlsubtitles.h"
+#include "htmlfont.h"
 #include <ctype.h>
-
-static int html_color_parse(void *log_ctx, const char *str)
-{
-    uint8_t rgba[4];
-    int nb_sharps = 0;
-    while (str[nb_sharps] == '#')
-        nb_sharps++;
-    str += FFMAX(0, nb_sharps - 1);
-    if (av_parse_color(rgba, str, strcspn(str, "\" >"), log_ctx) < 0)
-        return -1;
-    return rgba[0] | rgba[1] << 8 | rgba[2] << 16;
-}
 
 static void rstrip_spaces_buf(AVBPrint *buf)
 {
@@ -87,12 +76,6 @@ static void handle_open_brace(AVBPrint *dst, const char **inp, int *an, int *clo
     av_bprint_chars(dst, *in, 1);
 }
 
-struct font_tag {
-    char face[128];
-    int size;
-    uint32_t color;
-};
-
 /*
  * Fast code for scanning the rest of a tag. Functionally equivalent to
  * this sscanf call:
@@ -129,36 +112,12 @@ static int scantag(const char* in, char* buffer, int* lenp) {
 int ff_htmlmarkup_to_ass(void *log_ctx, AVBPrint *dst, const char *in)
 {
     char *param, buffer[128];
-    int len, tag_close, sptr = 0, line_start = 1, an = 0, end = 0;
+    int len, tag_close, line_start = 1, an = 0, end = 0;
     int closing_brace_missing = 0;
     int i, likely_a_tag;
 
-    /*
-     * state stack is only present for fonts since they are the only tags where
-     * the state is not binary. Here is a typical use case:
-     *
-     *   <font color="red" size=10>
-     *     red 10
-     *     <font size=50> RED AND BIG </font>
-     *     red 10 again
-     *   </font>
-     *
-     * On the other hand, using the state system for all the tags should be
-     * avoided because it breaks wrongly nested tags such as:
-     *
-     *   <b> foo <i> bar </b> bla </i>
-     *
-     * We don't want to break here; instead, we will treat all these tags as
-     * binary state markers. Basically, "<b>" will activate bold, and "</b>"
-     * will deactivate it, whatever the current state.
-     *
-     * This will also prevents cases where we have a random closing tag
-     * remaining after the opening one was dropped. Yes, this happens and we
-     * still don't want to print a "</b>" at the end of the dialog event.
-     */
-    struct font_tag stack[16];
-
-    memset(&stack[0], 0, sizeof(stack[0]));
+    struct torro_fonts fonts = {0};
+    const char *input_end = in + strlen(in);
 
     for (; !end && *in; in++) {
         switch (*in) {
@@ -180,7 +139,7 @@ int ff_htmlmarkup_to_ass(void *log_ctx, AVBPrint *dst, const char *in)
         case '{':
             handle_open_brace(dst, &in, &an, &closing_brace_missing);
             break;
-        case '<':
+        case '<': {
             /*
              * "<<" are likely latin guillemets in ASCII or some kind of random
              * style effect; see sub/badsyntax.srt in the FATE samples
@@ -199,6 +158,12 @@ int ff_htmlmarkup_to_ass(void *log_ctx, AVBPrint *dst, const char *in)
                 likely_a_tag = 1;
 
             av_assert0(in[0] == '<');
+
+            size_t font_len = torro_font_tag(dst, in, input_end - in, &fonts, log_ctx);
+            if (font_len) {
+                in += font_len - 1;
+                break;
+            }
 
             len = 0;
 
@@ -224,64 +189,7 @@ int ff_htmlmarkup_to_ass(void *log_ctx, AVBPrint *dst, const char *in)
                     }
                 }
 
-                if (!av_strcasecmp(tagname, "font")) {
-                    if (tag_close && sptr > 0) {
-                        struct font_tag *cur_tag  = &stack[sptr--];
-                        struct font_tag *last_tag = &stack[sptr];
-
-                        if (cur_tag->size) {
-                            if (!last_tag->size)
-                                av_bprintf(dst, "{\\fs}");
-                            else if (last_tag->size != cur_tag->size)
-                                av_bprintf(dst, "{\\fs%d}", last_tag->size);
-                        }
-
-                        if (cur_tag->color & 0xff000000) {
-                            if (!(last_tag->color & 0xff000000))
-                                av_bprintf(dst, "{\\c}");
-                            else if (last_tag->color != cur_tag->color)
-                                av_bprintf(dst, "{\\c&H%"PRIX32"&}", last_tag->color & 0xffffff);
-                        }
-
-                        if (cur_tag->face[0]) {
-                            if (!last_tag->face[0])
-                                av_bprintf(dst, "{\\fn}");
-                            else if (strcmp(last_tag->face, cur_tag->face))
-                                av_bprintf(dst, "{\\fn%s}", last_tag->face);
-                        }
-                    } else if (!tag_close && sptr < FF_ARRAY_ELEMS(stack) - 1) {
-                        struct font_tag *new_tag = &stack[sptr + 1];
-
-                        *new_tag = stack[sptr++];
-
-                        while (param) {
-                            if (!av_strncasecmp(param, "size=", 5)) {
-                                param += 5 + (param[5] == '"');
-                                if (sscanf(param, "%u", &new_tag->size) == 1)
-                                    av_bprintf(dst, "{\\fs%u}", new_tag->size);
-                            } else if (!av_strncasecmp(param, "color=", 6)) {
-                                int color;
-                                param += 6 + (param[6] == '"');
-                                color = html_color_parse(log_ctx, param);
-                                if (color >= 0) {
-                                    new_tag->color = 0xff000000 | color;
-                                    av_bprintf(dst, "{\\c&H%"PRIX32"&}", new_tag->color & 0xffffff);
-                                }
-                            } else if (!av_strncasecmp(param, "face=", 5)) {
-                                param += 5 + (param[5] == '"');
-                                len = strcspn(param,
-                                              param[-1] == '"' ? "\"" :" ");
-                                av_strlcpy(new_tag->face, param,
-                                           FFMIN(sizeof(new_tag->face), len+1));
-                                param += len;
-                                av_bprintf(dst, "{\\fn%s}", new_tag->face);
-                            }
-                            if ((param = strchr(param, ' ')))
-                                param++;
-                        }
-                    }
-                    in += skip;
-                } else if (tagname[0] && !tagname[1] && strchr("bisu", av_tolower(tagname[0]))) {
+                if (tagname[0] && !tagname[1] && strchr("bisu", av_tolower(tagname[0]))) {
                     av_bprintf(dst, "{\\%c%d}", (char)av_tolower(tagname[0]), !tag_close);
                     in += skip;
                 } else if (!av_strncasecmp(tagname, "br", 2) &&
@@ -299,6 +207,7 @@ int ff_htmlmarkup_to_ass(void *log_ctx, AVBPrint *dst, const char *in)
                 av_bprint_chars(dst, *in, 1);
             }
             break;
+        }
         default:
             av_bprint_chars(dst, *in, 1);
             break;
