@@ -82,6 +82,14 @@ int ff_aac_sbr_ctx_alloc_init_fixed(AACDecContext *ac, ChannelElement **che, int
 void ff_aac_sbr_ctx_close(ChannelElement *che);
 void ff_aac_sbr_ctx_close_fixed(ChannelElement *che);
 
+/**
+ * Return the SBR context of a ChannelElement to its pre-header state on
+ * decoder flush, so the first frame after a seek is not decoded against the
+ * previous frame's envelope and noise-floor deltas.
+ */
+void ff_aac_sbr_ctx_flush(ChannelElement *che);
+void ff_aac_sbr_ctx_flush_fixed(ChannelElement *che);
+
 /** Decode one SBR element. */
 int ff_aac_sbr_decode_extension(AACDecContext *ac, ChannelElement *che,
                                 GetBitContext *gb, int crc, int cnt, int id_aac,

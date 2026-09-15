@@ -119,6 +119,23 @@ av_cold void AAC_RENAME(ff_aac_sbr_ctx_close)(ChannelElement *che)
     av_tx_uninit(&sbr->mdct_ana);
 }
 
+/*
+ * Kodi 21.2 DVDAudioCodecFFmpeg.cpp: CDVDAudioCodecFFmpeg::Reset() is
+ * avcodec_flush_buffers() only, on stock FFmpeg whose aacdec flush() never
+ * touches SBR. env_facs_q[0] / noise_facs_q[0] then still hold the last
+ * pre-seek frame (read_sbr_envelope / read_sbr_noise carry-over), so a
+ * first frame coded with bs_df_env / bs_df_noise decodes against stale
+ * state: "env_facs_q %d is invalid" + sbr_turnoff() when the delta leaves
+ * range, wrong high-band levels when it does not. Deviation from stock
+ * FFmpeg and from Kodi, approved by the user (torro-player, 2026-09-15):
+ * restart SBR exactly as at stream start (ff_aac_sbr_ctx_alloc_init calls
+ * sbr_turnoff), off until the next bs_header_flag frame re-enables it.
+ */
+void AAC_RENAME(ff_aac_sbr_ctx_flush)(ChannelElement *che)
+{
+    sbr_turnoff(get_sbr(che));
+}
+
 static int qsort_comparison_function_int16(const void *a, const void *b)
 {
     return *(const int16_t *)a - *(const int16_t *)b;

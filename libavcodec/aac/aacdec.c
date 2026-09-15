@@ -565,6 +565,10 @@ static av_cold void flush(AVCodecContext *avctx)
                 for (j = 0; j <= 1; j++) {
                     memset(che->ch[j].saved, 0, sizeof(che->ch[j].saved));
                 }
+                // See ff_aac_sbr_ctx_flush: SBR delta state must not survive
+                // a seek flush (Kodi DVDAudioCodecFFmpeg.cpp Reset() +
+                // stock flush() leave it; approved deviation).
+                ac->proc.sbr_ctx_flush(che);
             }
         }
     }
