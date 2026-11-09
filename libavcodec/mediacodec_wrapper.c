@@ -54,6 +54,7 @@ struct JNIAMediaCodecListFields {
     jclass codec_capabilities_class;
     jfieldID color_formats_id;
     jfieldID profile_levels_id;
+    jmethodID is_format_supported_id;
 
     jclass codec_profile_level_class;
     jfieldID profile_id;
@@ -79,6 +80,7 @@ static const struct FFJniField jni_amediacodeclist_mapping[] = {
     { "android/media/MediaCodecInfo$CodecCapabilities", NULL, NULL, FF_JNI_CLASS, OFFSET(codec_capabilities_class), 1 },
         { "android/media/MediaCodecInfo$CodecCapabilities", "colorFormats", "[I", FF_JNI_FIELD, OFFSET(color_formats_id), 1 },
         { "android/media/MediaCodecInfo$CodecCapabilities", "profileLevels", "[Landroid/media/MediaCodecInfo$CodecProfileLevel;", FF_JNI_FIELD, OFFSET(profile_levels_id), 1 },
+        { "android/media/MediaCodecInfo$CodecCapabilities", "isFormatSupported", "(Landroid/media/MediaFormat;)Z", FF_JNI_METHOD, OFFSET(is_format_supported_id), 0 },
 
     { "android/media/MediaCodecInfo$CodecProfileLevel", NULL, NULL, FF_JNI_CLASS, OFFSET(codec_profile_level_class), 1 },
         { "android/media/MediaCodecInfo$CodecProfileLevel", "profile", "I", FF_JNI_FIELD, OFFSET(profile_id), 1 },
@@ -467,7 +469,8 @@ int ff_AMediaCodecProfile_getProfileFromAVCodecContext(AVCodecContext *avctx)
     return -1;
 }
 
-char *ff_AMediaCodecList_getCodecNameByType(const char *mime, int profile, int encoder, void *log_ctx)
+static char *get_codec_name(const char *mime, int profile, int encoder,
+                            FFAMediaFormat *format, int *next_codec, void *log_ctx)
 {
     int ret;
     int i;
@@ -505,7 +508,7 @@ char *ff_AMediaCodecList_getCodecNameByType(const char *mime, int profile, int e
         goto done;
     }
 
-    for(i = 0; i < codec_count; i++) {
+    for (i = next_codec ? *next_codec : 0; i < codec_count; i++) {
         int j;
         int type_count;
         int is_encoder;
@@ -584,6 +587,14 @@ char *ff_AMediaCodecList_getCodecNameByType(const char *mime, int profile, int e
             capabilities = (*env)->CallObjectMethod(env, info, jfields.get_codec_capabilities_id, type);
             if (ff_jni_exception_check(env, 1, log_ctx) < 0) {
                 goto done;
+            }
+
+            if (format && jfields.is_format_supported_id) {
+                jobject requested = ((FFAMediaFormatJni *)format)->object;
+                jboolean supported = (*env)->CallBooleanMethod(
+                    env, capabilities, jfields.is_format_supported_id, requested);
+                if (ff_jni_exception_check(env, 1, log_ctx) < 0 || !supported)
+                    goto done_with_type;
             }
 
             profile_levels = (*env)->GetObjectField(env, capabilities, jfields.profile_levels_id);
@@ -672,7 +683,20 @@ done:
         av_freep(&name);
     }
 
+    if (next_codec && found_codec)
+        *next_codec = i + 1;
     return name;
+}
+
+char *ff_AMediaCodecList_getCodecNameByType(const char *mime, int profile, int encoder, void *log_ctx)
+{
+    return get_codec_name(mime, profile, encoder, NULL, NULL, log_ctx);
+}
+
+char *ff_AMediaCodecList_getNextDecoder(const char *mime, int profile,
+                                       FFAMediaFormat *jni_format, int *next_codec, void *log_ctx)
+{
+    return get_codec_name(mime, profile, 0, jni_format, next_codec, log_ctx);
 }
 
 static FFAMediaFormat *mediaformat_jni_new(void)

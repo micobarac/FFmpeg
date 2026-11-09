@@ -60,6 +60,10 @@ int ff_AMediaCodecProfile_getProfileFromAVCodecContext(AVCodecContext *avctx);
 char *ff_AMediaCodecList_getCodecNameByType(const char *mime, int profile, int encoder, void *log_ctx);
 
 typedef struct FFAMediaFormat FFAMediaFormat;
+/* Pass a format created with ff_AMediaFormat_new(0). The cursor starts at zero. */
+char *ff_AMediaCodecList_getNextDecoder(const char *mime, int profile,
+                                       FFAMediaFormat *jni_format, int *next_codec, void *log_ctx);
+
 struct FFAMediaFormat {
     const AVClass *class;
 

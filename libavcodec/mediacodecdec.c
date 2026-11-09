@@ -306,16 +306,39 @@ static int common_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
 }
 #endif
 
+static int init_decoder(AVCodecContext *avctx, const char *mime, FFAMediaFormat *format,
+                        const char *name)
+{
+    MediaCodecH264DecContext *s = avctx->priv_data;
+    MediaCodecDecContext *ctx = av_mallocz(sizeof(*ctx));
+    int ret;
+
+    if (!ctx)
+        return AVERROR(ENOMEM);
+    if (name && !(ctx->codec_name = av_strdup(name))) {
+        av_free(ctx);
+        return AVERROR(ENOMEM);
+    }
+    ctx->delay_flush = s->delay_flush;
+    ctx->use_ndk_codec = s->use_ndk_codec;
+    ret = ff_mediacodec_dec_init(avctx, ctx, mime, format);
+    // The common initializer frees the context on failure.
+    if (ret >= 0)
+        s->ctx = ctx;
+    return ret;
+}
+
 static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
 {
     int ret;
     int sdk_int;
 
     const char *codec_mime = NULL;
-    /* Decoder resolved by the Dolby Vision path below, handed to
-     * ff_mediacodec_dec_init() so it doesn't re-resolve one using the
-     * HEVC profile of the stream. Ownership moves to s->ctx. */
     char *dv_codec_name = NULL;
+    int dv_profile = 0;
+    int dv_level = 0;
+    bool can_use_base_layer = false;
+    bool base_layer_only = false;
 
     FFAMediaFormat *format = NULL;
     MediaCodecH264DecContext *s = avctx->priv_data;
@@ -323,6 +346,7 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
     if (s->use_ndk_codec < 0)
         s->use_ndk_codec = !av_jni_get_java_vm(avctx);
 
+configure_format:
     format = ff_AMediaFormat_new(s->use_ndk_codec);
     if (!format) {
         av_log(avctx, AV_LOG_ERROR, "Failed to create media format\n");
@@ -372,13 +396,20 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
                 avctx->coded_side_data, avctx->nb_coded_side_data,
                 AV_PKT_DATA_DOVI_CONF);
 
-            if (sd && sd->size >= sizeof(AVDOVIDecoderConfigurationRecord)) {
+            if (!base_layer_only && sd && sd->size >= sizeof(AVDOVIDecoderConfigurationRecord)) {
                 const AVDOVIDecoderConfigurationRecord *dovi =
                     (const AVDOVIDecoderConfigurationRecord *)sd->data;
                 /* CodecProfileLevel.DolbyVisionProfileDvheStn / DvheSt */
-                int dv_profile = dovi->dv_profile == 5   ? 0x20
+                dv_profile = dovi->dv_profile == 5   ? 0x20
                                  : dovi->dv_profile == 8 ? 0x100
                                                          : 0;
+
+                dv_level = dovi->dv_level;
+                // Dolby Vision bitstream profiles table: CCID 1/2/4
+                // declares HDR10, SDR, or HLG base-layer compatibility.
+                int ccid = dovi->dv_bl_signal_compatibility_id;
+                can_use_base_layer = dovi->dv_profile == 8 && dovi->bl_present_flag &&
+                    (ccid == 1 || ccid == 2 || ccid == 4);
 
                 if (dv_profile) {
                     dv_codec_name = ff_AMediaCodecList_getCodecNameByType(
@@ -507,25 +538,42 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
     if (s->operating_rate > 0)
         ff_AMediaFormat_setInt32(format, "operating-rate", s->operating_rate);
 
-    s->ctx = av_mallocz(sizeof(*s->ctx));
-    if (!s->ctx) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to allocate MediaCodecDecContext\n");
-        ret = AVERROR(ENOMEM);
-        goto done;
+    ret = init_decoder(avctx, codec_mime, format, dv_codec_name);
+    if (ret == AVERROR_EXTERNAL && dv_codec_name) {
+        // Keep the established first choice on devices where it works.
+        // Query alternate decoders with the actual dimensions and DV level
+        // only after it fails. A JNI query works for NDK decoding too.
+        FFAMediaFormat *query = ff_AMediaFormat_new(0);
+        if (query) {
+            ff_AMediaFormat_setString(query, "mime", codec_mime);
+            ff_AMediaFormat_setInt32(query, "width", avctx->width);
+            ff_AMediaFormat_setInt32(query, "height", avctx->height);
+            ff_AMediaFormat_setInt32(query, "profile", dv_profile);
+            // Android CodecProfileLevel maps Dolby Vision levels 1–12 to bit flags.
+            if (dv_level >= 1 && dv_level <= 12)
+                ff_AMediaFormat_setInt32(query, "level", 1 << (dv_level - 1));
+            int next = 0;
+            char *alternative;
+            while (ret == AVERROR_EXTERNAL &&
+                   (alternative = ff_AMediaCodecList_getNextDecoder(codec_mime, dv_profile,
+                                                                  query, &next, avctx))) {
+                if (strcmp(alternative, dv_codec_name))
+                    ret = init_decoder(avctx, codec_mime, format, alternative);
+                av_free(alternative);
+            }
+            ff_AMediaFormat_delete(query);
+        }
+        if (ret == AVERROR_EXTERNAL && can_use_base_layer) {
+            av_log(avctx, AV_LOG_WARNING,
+                   "Dolby Vision decoder rejected the stream; trying its compatible HEVC base layer\n");
+            ff_AMediaFormat_delete(format);
+            av_freep(&dv_codec_name);
+            base_layer_only = true;
+            goto configure_format;
+        }
     }
-
-    s->ctx->delay_flush = s->delay_flush;
-    s->ctx->use_ndk_codec = s->use_ndk_codec;
-    /* Already resolved against the Dolby Vision profile; keeps
-     * mediacodec_dec_get_video_codec() from looking one up again with
-     * the stream's HEVC profile, which no DV decoder advertises. */
-    s->ctx->codec_name = dv_codec_name;
-    dv_codec_name = NULL;
-
-    if ((ret = ff_mediacodec_dec_init(avctx, s->ctx, codec_mime, format)) < 0) {
-        s->ctx = NULL;
+    if (ret < 0)
         goto done;
-    }
 
     av_log(avctx, AV_LOG_INFO,
            "MediaCodec started successfully: codec = %s, ret = %d\n",
@@ -546,7 +594,6 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
     }
 
 done:
-    /* Only still set if we bailed out before handing it to s->ctx. */
     av_freep(&dv_codec_name);
 
     if (format) {
